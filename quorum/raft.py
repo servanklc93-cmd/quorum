@@ -26,7 +26,7 @@ etcd uses in production:
                follower that heard from a leader recently ignores vote requests
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from .storage import Entry, Snapshot
 

@@ -3,7 +3,6 @@ not) on purpose, so specific scenarios from the paper can be replayed."""
 
 import random
 
-import pytest
 
 from quorum.raft import (
     CANDIDATE, FOLLOWER, LEADER, AppendEntries, AppendResponse, Config, Raft, RequestVote,

@@ -26,7 +26,7 @@ import heapq
 import json
 import random
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from .kv import KVStore
 from .linearizability import Op, check
@@ -429,8 +429,10 @@ def main(argv=None):
     for seed in range(args.start, args.start + args.seeds):
         try:
             stats = Simulation(seed, nodes=args.nodes).run(chaos_ticks=args.ticks)
-        except Violation as e:
-            print(f"seed {seed}: FAILED: {e}")
+        except Exception as e:
+            # an unexpected exception is a bug just as much as a broken invariant
+            kind = "" if isinstance(e, Violation) else f"crashed with {type(e).__name__}: "
+            print(f"seed {seed}: FAILED: {kind}{e}")
             print(f"reproduce with: python -m quorum.sim --start {seed} --seeds 1")
             return 1
         for k in vars(totals):
