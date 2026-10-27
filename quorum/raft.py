@@ -264,6 +264,10 @@ class Raft:
         if self.elapsed >= self.timeout:
             self._start_election(pre_vote=self.cfg.pre_vote)
 
+    def campaign(self):
+        """Start an election right now (tests, and leadership transfer)."""
+        self._start_election(pre_vote=False)
+
     # --- client commands ----------------------------------------------------------
 
     def propose(self, command):
@@ -432,13 +436,19 @@ class Raft:
             return
         pr = self.progress[m.src]
         pr.active = True
+        # flow control: only a response that tells us something new triggers
+        # an immediate send. otherwise every heartbeat starts another chain of
+        # append -> response -> append that never dies out while a follower is
+        # behind, and duplicated messages multiply those chains. the simulator
+        # found this: one run went to 2,000 messages per tick.
         if m.success:
-            if m.match_index > pr.match_index:
-                pr.match_index = m.match_index
-                self._advance_commit()
+            if m.match_index <= pr.match_index:
+                return                      # a duplicate or a stale ack
+            pr.match_index = m.match_index
             pr.next_index = max(pr.next_index, pr.match_index + 1)
+            self._advance_commit()
             if pr.next_index <= self.last_index:
-                self._send_append(m.src)   # more to send
+                self._send_append(m.src)    # more to send
             return
         # back up next_index using the follower's hint (§5.3, the optimisation
         # at the end): skip a whole conflicting term per round trip
@@ -456,7 +466,10 @@ class Raft:
                 i -= 1
             if last_of_term is not None:
                 nxt = last_of_term + 1
-        pr.next_index = max(min(nxt, self.last_index + 1), pr.match_index + 1, 1)
+        nxt = max(min(nxt, self.last_index + 1), pr.match_index + 1, 1)
+        if nxt >= pr.next_index:
+            return                          # nothing learned; the next heartbeat retries
+        pr.next_index = nxt
         self._send_append(m.src)
 
     def _on_snapshot(self, m):
@@ -480,7 +493,9 @@ class Raft:
             return
         pr = self.progress[m.src]
         pr.active = True
-        pr.match_index = max(pr.match_index, m.index)
+        if m.index <= pr.match_index:
+            return
+        pr.match_index = m.index
         pr.next_index = pr.match_index + 1
         self._advance_commit()
         if pr.next_index <= self.last_index:
