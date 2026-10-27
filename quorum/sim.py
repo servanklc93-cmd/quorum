@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 
 from .kv import KVStore
 from .linearizability import Op, check
-from .raft import LEADER, Config, Raft
+from .raft import LEADER, AppendEntries, AppendResponse, Config, Raft, VoteResponse
 from .storage import MemoryStorage
 
 
@@ -47,6 +47,11 @@ class Faults:
     restart: float = 0.03         # per tick: a dead node comes back
     partition: float = 0.006      # per tick: the network splits in two
     heal: float = 0.02            # per tick: the split goes away
+    # "buggify": crash a node at a moment that matters (just after it voted,
+    # just after it appended as leader, just after it acked entries) and bring
+    # it back a few ticks later. random crashes almost never land in those
+    # windows, and that's where the interesting bugs live.
+    buggify: float = 0.0
 
 
 @dataclass
@@ -73,15 +78,45 @@ class Stats:
     max_term: int = 0
 
 
+def swarm(rng):
+    """A random cluster configuration and fault profile for one run.
+
+    "Swarm testing" (Groce et al., 2012): rather than one fixed setup, each
+    seed gets its own mix of features and fault rates. Some bugs only show up
+    with PreVote off, or with a 3-node cluster, or under a storm of crashes;
+    a single configuration would keep missing them.
+    """
+    config = Config(
+        election_ticks=rng.choice([5, 10, 20]),
+        heartbeat_ticks=rng.randint(1, 3),
+        pre_vote=rng.random() < 0.5,
+        check_quorum=rng.random() < 0.5,
+    )
+    faults = Faults(
+        drop=rng.choice([0.0, 0.02, 0.1, 0.25]),
+        duplicate=rng.choice([0.0, 0.02, 0.1]),
+        # Raft needs messages to be much faster than the election timeout; past
+        # that no leader survives long enough to do anything, so it's not tested
+        max_delay=rng.randint(1, config.election_ticks // 2),
+        crash=rng.choice([0.0, 0.002, 0.01, 0.03]),
+        restart=rng.choice([0.02, 0.1, 0.5]),
+        partition=rng.choice([0.0, 0.005, 0.02]),
+        heal=rng.choice([0.01, 0.05, 0.2]),
+        buggify=rng.choice([0.0, 0.0, 0.05, 0.2]),
+    )
+    return config, faults, rng.choice([3, 5, 5, 7]), rng.choice([10, 40, 200])
+
+
 class Simulation:
-    def __init__(self, seed, nodes=5, clients=3, keys=("a", "b", "c"), faults=None,
-                 config=None, snapshot_every=40):
+    def __init__(self, seed, nodes=None, clients=3, keys=("a", "b", "c"), faults=None,
+                 config=None, snapshot_every=None):
         self.seed = seed
         self.rng = random.Random(seed)
-        self.ids = list(range(1, nodes + 1))
-        self.faults = faults or Faults()
-        self.config = config or Config()
-        self.snapshot_every = snapshot_every
+        s_config, s_faults, s_nodes, s_snap = swarm(random.Random(seed * 7919 + 1))
+        self.ids = list(range(1, (nodes or s_nodes) + 1))
+        self.faults = faults or s_faults
+        self.config = config or s_config
+        self.snapshot_every = snapshot_every or s_snap
         self.keys = keys
 
         self.storage = {i: MemoryStorage() for i in self.ids}
@@ -101,6 +136,7 @@ class Simulation:
         self.stats = Stats()
         self.chaos = True
         self.retry_after = 3 * self.config.election_ticks
+        self.restart_at = {}
 
         # global record, for the safety checks
         self.leader_of_term = {}
@@ -120,6 +156,7 @@ class Simulation:
 
     def crash(self, i):
         # the process dies: memory and in-flight work are gone, the disk stays
+        self.storage[i].crash()
         del self.nodes[i]
         del self.kv[i]
         del self.pending[i]
@@ -154,14 +191,26 @@ class Simulation:
 
     def _drain(self, i):
         node = self.nodes[i]
+        risky = False
         for msg in node.take_messages():
             self._send(msg)
+            if isinstance(msg, VoteResponse) and msg.granted and not msg.pre_vote:
+                risky = True
+            elif isinstance(msg, AppendEntries) and msg.entries:
+                risky = True
+            elif isinstance(msg, AppendResponse) and msg.success:
+                risky = True
         for c in node.take_committed():
             if c.snapshot is not None:
                 self._install(i, c)
             else:
                 self._apply(i, c)
         self._check_node(i)
+        if risky and self.chaos and self.rng.random() < self.faults.buggify:
+            alive = sum(self.up(x) for x in self.ids)
+            if alive > len(self.ids) // 2:
+                self.crash(i)
+                self.restart_at[i] = self.time + self.rng.randint(1, 5)
 
     def _install(self, i, c):
         expected = self.state_at.get(c.index)
@@ -290,7 +339,9 @@ class Simulation:
     def _drive_clients(self):
         for cl in self.clients:
             if cl.op is None:
-                if self.rng.random() < 0.3:
+                # once the network has healed, clients only finish what they started;
+                # otherwise "everyone is done" would depend on luck at the last tick
+                if self.chaos and self.rng.random() < 0.3:
                     self._new_op(cl)
             elif self.time - cl.sent_at > self.retry_after:
                 self.stats.retries += 1
@@ -306,7 +357,8 @@ class Simulation:
                 alive = sum(self.up(x) for x in self.ids)
                 if rng.random() < f.crash and alive > len(self.ids) // 2:
                     self.crash(i)
-            elif rng.random() < f.restart:
+            elif self.restart_at.get(i, float("inf")) <= self.time or rng.random() < f.restart:
+                self.restart_at.pop(i, None)
                 self._boot(i)
                 self._drain(i)
         if self.groups is None and rng.random() < f.partition:
@@ -370,7 +422,7 @@ def main(argv=None):
     p.add_argument("--seeds", type=int, default=200)
     p.add_argument("--start", type=int, default=0)
     p.add_argument("--ticks", type=int, default=2000)
-    p.add_argument("--nodes", type=int, default=5)
+    p.add_argument("--nodes", type=int, default=None, help="default: chosen per seed")
     args = p.parse_args(argv)
 
     totals = Stats()
